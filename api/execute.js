@@ -3,13 +3,18 @@ export default async function handler(req, res) {
     return res.status(405).json({ message: 'Method Not Allowed' });
   }
 
-  // 1. Get data GHL sent in the POST body
-  const { httpMethod, apiUrl, headers, query, body } = req.body;
+  // 1. Get data GHL sent in the POST body using YOUR keys
+  const { method, url, headers, query, body } = req.body;
   const youtubeToken = req.headers['authorization']; // Auto-added by GHL
 
-  if (!httpMethod || !apiUrl) {
-    return res.status(400).json({ message: 'Missing required fields: httpMethod or apiUrl' });
+  if (!method || !url) {
+    return res.status(400).json({ message: 'Missing required fields: method or url' });
   }
+  
+  // Renaming keys internally for script consistency
+  const httpMethod = method;
+  const apiUrl = url;
+
 
   // 2. Prepare the request URL with query parameters
   const fullUrl = new URL(apiUrl);
