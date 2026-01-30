@@ -1,99 +1,123 @@
 export default async function handler(req, res) {
-  if (req.method !== "POST") {
-    return res.status(405).json({ success: false, errorMessage: "Method Not Allowed" });
-  }
+  if (req.method !== "POST") return res.status(405).json({ message: "Method Not Allowed" });
 
-  // ✅ IMPORTANTE: con "Body: Default" en GHL, los inputs llegan en req.body.data
-  const payload = req.body?.data ?? req.body ?? {};
-  const { method, url, headers, query, body } = payload;
+  const { method, url, headers, query, body } = req.body || {};
+  const auth = req.headers["authorization"]; // "Bearer xxx" (GHL lo manda)
 
-  const auth = req.headers?.authorization; // lo manda GHL automático
+  if (!method || !url) return res.status(400).json({ message: "Missing required fields: method or url" });
 
-  if (!method || !url) {
-    return res.status(200).json({
-      success: false,
-      status: 400,
-      errorMessage: "Missing required fields: method or url",
-      errorReason: "badRequest",
-      request: { method, url }
-    });
-  }
-
-  const httpMethod = String(method).toUpperCase();
-  const fullUrl = new URL(url);
-
-  // query puede venir como string JSON
-  try {
-    const q = typeof query === "string" ? (query.trim() ? JSON.parse(query) : {}) : (query || {});
-    for (const [k, v] of Object.entries(q)) fullUrl.searchParams.set(k, String(v));
-  } catch (e) {}
-
-  // headers puede venir como string JSON
-  let userHeaders = {};
-  try {
-    userHeaders = typeof headers === "string" ? (headers.trim() ? JSON.parse(headers) : {}) : (headers || {});
-  } catch (e) {}
-
-  const finalHeaders = {
-    accept: "application/json",
-    ...(auth ? { authorization: auth } : {}),
-    ...userHeaders
+  const safeJson = (v) => {
+    if (v == null) return null;
+    if (typeof v === "object") return v;
+    try { return JSON.parse(v); } catch { return null; }
   };
 
-  let requestBody;
-  if (["POST", "PUT", "PATCH"].includes(httpMethod)) {
-    try {
-      const b = typeof body === "string" ? (body.trim() ? JSON.parse(body) : null) : (body ?? null);
-      requestBody = b ? JSON.stringify(b) : undefined;
-      if (requestBody) finalHeaders["content-type"] = "application/json";
-    } catch (e) {}
+  // Array -> Object con key real (id/reason/name), si no, index
+  const arrayToKeyedObject = (arr) => {
+    // 1) id
+    if (arr.every(x => x && typeof x === "object" && ("id" in x))) {
+      const o = {};
+      for (const it of arr) o[String(it.id)] = transformDeep(it);
+      return o;
+    }
+    // 2) reason (YouTube errors)
+    if (arr.every(x => x && typeof x === "object" && ("reason" in x))) {
+      const o = {};
+      for (const it of arr) o[String(it.reason)] = transformDeep(it);
+      return o;
+    }
+    // 3) name
+    if (arr.every(x => x && typeof x === "object" && ("name" in x))) {
+      const o = {};
+      for (const it of arr) o[String(it.name)] = transformDeep(it);
+      return o;
+    }
+    // 4) fallback index
+    const o = {};
+    arr.forEach((it, i) => { o[String(i)] = transformDeep(it); });
+    return o;
+  };
+
+  const transformDeep = (value) => {
+    if (Array.isArray(value)) return arrayToKeyedObject(value);
+    if (value && typeof value === "object") {
+      const out = {};
+      for (const [k, v] of Object.entries(value)) out[k] = transformDeep(v);
+      return out;
+    }
+    return value;
+  };
+
+  // Build URL + query
+  const fullUrl = new URL(url);
+  const q = safeJson(query);
+  if (q && typeof q === "object") {
+    for (const [k, v] of Object.entries(q)) {
+      if (v === undefined || v === null) continue;
+      fullUrl.searchParams.set(k, String(v));
+    }
+  }
+
+  // Headers
+  const h = safeJson(headers) || {};
+  const finalHeaders = {
+    ...(typeof h === "object" ? h : {}),
+    ...(auth ? { Authorization: auth } : {}),
+    Accept: "application/json",
+  };
+
+  // Body
+  const upperMethod = String(method).toUpperCase();
+  const needsBody = ["POST", "PUT", "PATCH"].includes(upperMethod);
+  let requestBody = undefined;
+
+  if (needsBody && body) {
+    const b = safeJson(body);
+    requestBody = b ? JSON.stringify(b) : String(body);
+    if (!Object.keys(finalHeaders).some(k => k.toLowerCase() === "content-type")) {
+      finalHeaders["Content-Type"] = "application/json";
+    }
   }
 
   try {
     const r = await fetch(fullUrl.toString(), {
-      method: httpMethod,
+      method: upperMethod,
       headers: finalHeaders,
-      body: requestBody
+      body: needsBody ? requestBody : undefined,
     });
 
     const text = await r.text();
-    let json = null;
-    try { json = text ? JSON.parse(text) : null; } catch (e) {}
+    let ytJson = null;
+    try { ytJson = text ? JSON.parse(text) : {}; } catch { ytJson = { raw: text }; }
 
-    const firstItem = Array.isArray(json?.items) && json.items[0] ? json.items[0] : null;
+    // 🔥 aquí se convierte items[] -> items{<id>: {...}}
+    const data = transformDeep(ytJson);
 
     return res.status(200).json({
-      success: r.ok && !json?.error,
-      status: r.status,
-      headers: Object.fromEntries(r.headers.entries()),
-      content: text,
-      data: json,
-
-      kind: json?.kind ?? null,
-      etag: json?.etag ?? null,
-      nextPageToken: json?.nextPageToken ?? null,
-      pageInfo: json?.pageInfo ?? null,
-
-      id: json?.id ?? firstItem?.id ?? null,
-      firstItemId: firstItem?.id ?? null,
-
-      title: firstItem?.snippet?.title ?? json?.snippet?.title ?? null,
-      scheduledStartTime: firstItem?.snippet?.scheduledStartTime ?? json?.snippet?.scheduledStartTime ?? null,
-      privacyStatus: firstItem?.status?.privacyStatus ?? json?.status?.privacyStatus ?? null,
-      lifeCycleStatus: firstItem?.status?.lifeCycleStatus ?? json?.status?.lifeCycleStatus ?? null,
-
-      errorMessage: json?.error?.message ?? null,
-      errorReason: json?.error?.errors?.[0]?.reason ?? null,
-
-      request: { method: httpMethod, url: fullUrl.toString() }
+      request: {
+        method: upperMethod,
+        url: fullUrl.toString(),
+        headers: { ...finalHeaders, Authorization: auth ? "Bearer ***" : undefined },
+        body: needsBody ? safeJson(body) ?? body ?? null : null
+      },
+      response: {
+        status: r.status,
+        headers: Object.fromEntries(r.headers.entries())
+      },
+      data
     });
-  } catch (err) {
+
+  } catch (e) {
     return res.status(200).json({
-      success: false,
-      status: 500,
-      errorMessage: err?.message ?? "Unknown error",
-      errorReason: "serverError",
-      request: { method: httpMethod, url: fullUrl.toString() }
+      request: { method: upperMethod, url: fullUrl.toString() },
+      response: { status: 500, headers: {} },
+      data: {
+        error: {
+          code: 500,
+          message: e.message,
+          reason: "bridge_error"
+        }
+      }
     });
   }
 }
