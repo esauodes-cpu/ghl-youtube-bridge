@@ -1,15 +1,17 @@
 export default async function handler(req, res) {
   if (req.method !== "POST") {
-    return res.status(405).json({ status: 405, errorMessage: "Method Not Allowed" });
+    return res.status(405).json({ success: false, errorMessage: "Method Not Allowed" });
   }
 
-  const input = req.body || {};
-  // GHL Test Fix: Provide defaults if user hasn't filled out fields yet
-  const method = String(input.method || "GET").toUpperCase(); 
-  const url = String(input.url || "https://www.googleapis.com").trim();
+  // ✅ IMPORTANTE: con "Body: Default" en GHL, los inputs llegan en req.body.data
+  const payload = req.body?.data ?? req.body ?? {};
+  const { method, url, headers, query, body } = payload;
+
+  const auth = req.headers?.authorization; // lo manda GHL automático
 
   if (!method || !url) {
-    return res.status(200).json({ // Return 200 for GHL test UI, but with error info
+    return res.status(200).json({
+      success: false,
       status: 400,
       errorMessage: "Missing required fields: method or url",
       errorReason: "badRequest",
@@ -17,110 +19,81 @@ export default async function handler(req, res) {
     });
   }
 
-  // ---- helpers
-  const tryParseJson = (v) => {
-    if (v == null) return null;
-    if (typeof v === "object") return v;
-    const s = String(v).trim();
-    if (!s) return null;
-    try { return JSON.parse(s); } catch { return null; }
-  };
-
-  // query: expects JSON like {"part":"snippet","mine":"true"}
-  const queryObj = tryParseJson(input.query) || {};
-
-  // headers: expects JSON like {"accept":"application/json"}
-  const userHeaders = tryParseJson(input.headers) || {};
-
-  // body: expects JSON for POST/PUT/PATCH
-  const bodyObj = tryParseJson(input.body);
-
-  // ---- build url with query params
+  const httpMethod = String(method).toUpperCase();
   const fullUrl = new URL(url);
-  Object.entries(queryObj).forEach(([k, v]) => {
-    if (v === undefined || v === null) return;
-    fullUrl.searchParams.set(k, String(v));
-  });
 
-  // ---- authorization injected by GHL external auth (typically)
-  const authHeader = req.headers["authorization"] || req.headers["Authorization"] || "";
+  // query puede venir como string JSON
+  try {
+    const q = typeof query === "string" ? (query.trim() ? JSON.parse(query) : {}) : (query || {});
+    for (const [k, v] of Object.entries(q)) fullUrl.searchParams.set(k, String(v));
+  } catch (e) {}
 
-  // ---- final headers
+  // headers puede venir como string JSON
+  let userHeaders = {};
+  try {
+    userHeaders = typeof headers === "string" ? (headers.trim() ? JSON.parse(headers) : {}) : (headers || {});
+  } catch (e) {}
+
   const finalHeaders = {
     accept: "application/json",
-    ...Object.fromEntries(
-      Object.entries(userHeaders).map(([k, v]) => [String(k).toLowerCase(), String(v)])
-    )
+    ...(auth ? { authorization: auth } : {}),
+    ...userHeaders
   };
 
-  // Always enforce auth from GHL if present
-  if (authHeader) finalHeaders["authorization"] = authHeader;
-
-  const methodNeedsBody = ["POST", "PUT", "PATCH"].includes(method);
   let requestBody;
-
-  if (methodNeedsBody && bodyObj != null) {
-    requestBody = typeof bodyObj === "string" ? bodyObj : JSON.stringify(bodyObj);
-    if (!finalHeaders["content-type"]) finalHeaders["content-type"] = "application/json";
+  if (["POST", "PUT", "PATCH"].includes(httpMethod)) {
+    try {
+      const b = typeof body === "string" ? (body.trim() ? JSON.parse(body) : null) : (body ?? null);
+      requestBody = b ? JSON.stringify(b) : undefined;
+      if (requestBody) finalHeaders["content-type"] = "application/json";
+    } catch (e) {}
   }
 
-  // ---- do request
-  let resp, text, parsed;
   try {
-    resp = await fetch(fullUrl.toString(), {
-      method,
+    const r = await fetch(fullUrl.toString(), {
+      method: httpMethod,
       headers: finalHeaders,
-      body: methodNeedsBody ? requestBody : undefined
+      body: requestBody
     });
 
-    text = await resp.text();
-    try { parsed = text ? JSON.parse(text) : null; } catch { parsed = null; }
-  } catch (e) {
-    // Return 200 for GHL test UI compatibility even on fetch failure
+    const text = await r.text();
+    let json = null;
+    try { json = text ? JSON.parse(text) : null; } catch (e) {}
+
+    const firstItem = Array.isArray(json?.items) && json.items[0] ? json.items[0] : null;
+
     return res.status(200).json({
+      success: r.ok && !json?.error,
+      status: r.status,
+      headers: Object.fromEntries(r.headers.entries()),
+      content: text,
+      data: json,
+
+      kind: json?.kind ?? null,
+      etag: json?.etag ?? null,
+      nextPageToken: json?.nextPageToken ?? null,
+      pageInfo: json?.pageInfo ?? null,
+
+      id: json?.id ?? firstItem?.id ?? null,
+      firstItemId: firstItem?.id ?? null,
+
+      title: firstItem?.snippet?.title ?? json?.snippet?.title ?? null,
+      scheduledStartTime: firstItem?.snippet?.scheduledStartTime ?? json?.snippet?.scheduledStartTime ?? null,
+      privacyStatus: firstItem?.status?.privacyStatus ?? json?.status?.privacyStatus ?? null,
+      lifeCycleStatus: firstItem?.status?.lifeCycleStatus ?? json?.status?.lifeCycleStatus ?? null,
+
+      errorMessage: json?.error?.message ?? null,
+      errorReason: json?.error?.errors?.[0]?.reason ?? null,
+
+      request: { method: httpMethod, url: fullUrl.toString() }
+    });
+  } catch (err) {
+    return res.status(200).json({
+      success: false,
       status: 500,
-      headers: {},
-      content: "",
-      data: null,
-      errorMessage: e.message || "Fetch failed",
-      errorReason: "fetchError",
-      request: {
-        method,
-        url: fullUrl.toString(),
-        headers: { ...finalHeaders, authorization: authHeader ? "Bearer ***" : "" }
-      }
+      errorMessage: err?.message ?? "Unknown error",
+      errorReason: "serverError",
+      request: { method: httpMethod, url: fullUrl.toString() }
     });
   }
-
-  // ---- Convenience “official” fields (works across your 3 endpoints)
-  const data = parsed;
-  const items = data && Array.isArray(data.items) ? data.items : null;
-  const firstItem = items && items[0] ? items[0] : null;
-  const firstItemId = firstItem && firstItem.id ? firstItem.id : null;
-  const id = (data && data.id) ? data.id : firstItemId;
-  // ... (Other specific field extractions were condensed in previous response) ...
-
-  const errorMessage =
-    (data && data.error && data.error.message) ||
-    (!resp.ok ? (text || resp.statusText || "Request failed") : null);
-
-  const errorReason =
-    (data && data.error && Array.isArray(data.error.errors) && data.error.errors[0] && data.error.errors[0].reason) ||
-    (!resp.ok ? "youtubeError" : null);
-
-  // ---- final wrapper response (stable)
-  // We return the raw 'data' here, which makes all sub-fields available in GHL
-  return res.status(200).json({
-    status: resp.status,
-    headers: Object.fromEntries(resp.headers.entries()),
-    content: text || "",
-    data: data ?? null, // THIS CONTAINS EVERYTHING NESTED
-    errorMessage,
-    errorReason,
-    request: {
-      method,
-      url: fullUrl.toString(),
-      headers: { ...finalHeaders, authorization: authHeader ? "Bearer ***" : "" }
-    }
-  });
 }
